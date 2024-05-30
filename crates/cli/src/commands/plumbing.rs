@@ -95,7 +95,7 @@ pub enum PlumbingArgs {
 
 fn read_input(shared_args: &SharedPlumbingArgs) -> Result<String> {
     let buffer = if let Some(input) = &shared_args.input {
-        std::fs::read_to_string(input)?
+        fs_err::read_to_string(input)?
     } else {
         let mut buffer = String::new();
         stdin().read_to_string(&mut buffer)?;
@@ -202,7 +202,7 @@ pub(crate) async fn run_plumbing(
             if input.paths.is_empty() {
                 return Ok(());
             }
-            init_global_grit_modules::<KeepFetcherKind>().await?;
+            init_global_grit_modules::<KeepFetcherKind>(None).await?;
             let combined_args = CheckArg {
                 paths: input.paths,
                 ..args

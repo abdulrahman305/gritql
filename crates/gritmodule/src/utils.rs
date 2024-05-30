@@ -4,6 +4,8 @@ use anyhow::{bail, Result};
 use marzano_core::api::MatchResult;
 use regex::Regex;
 
+use crate::fetcher::ModuleRepo;
+
 /// Extracts the *rewritten* (after applying a pattern) path from a `MatchResult`.
 pub fn extract_path(result: &MatchResult) -> Option<&String> {
     match result {
@@ -23,11 +25,26 @@ pub fn remove_dir_all_safe(dir: &Path) -> Result<()> {
     if current_exe()?.starts_with(canonicalize(dir)?) {
         bail!("Fatal error: refusing to remove the directory containing the current executable")
     }
-    std::fs::remove_dir_all(dir)?;
+    fs_err::remove_dir_all(dir)?;
     Ok(())
 }
 
 pub fn is_pattern_name(pattern: &str) -> bool {
     let regex = Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*(\(\))?$").unwrap();
     regex.is_match(pattern)
+}
+
+pub fn parse_remote_name(pattern: &str) -> Option<ModuleRepo> {
+    let hash_index = pattern.find('#');
+    let hash_index = match hash_index {
+        Some(index) => index,
+        None => return None,
+    };
+    let repo_str = &pattern[..hash_index];
+    let pattern_name = &pattern[hash_index + 1..];
+    if is_pattern_name(pattern_name) {
+        ModuleRepo::from_repo_str(repo_str).ok()
+    } else {
+        None
+    }
 }

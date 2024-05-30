@@ -186,7 +186,7 @@ impl MatchResult {
         let original_file_name = self.extract_original_path()?;
         let original_match = self.extract_original_match()?;
 
-        let original_src = std::fs::read_to_string(original_file_name).ok()?;
+        let original_src = fs_err::read_to_string(original_file_name).ok()?;
         let rewritten_content =
             split_string_at_indices(&original_src, ranges_starts).join(&comment);
         let ef = EntireFile::file_to_entire_file(original_file_name, &rewritten_content, None);
@@ -285,10 +285,14 @@ pub struct InputFile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct Match {
+    #[serde(default)]
     pub messages: Vec<Message>,
+    #[serde(default)]
     pub variables: Vec<VariableMatch>,
     pub source_file: String,
+    #[serde(default)]
     pub ranges: Vec<Range>,
+    #[serde(default)]
     pub debug: String,
 }
 
@@ -330,7 +334,9 @@ impl FileMatchResult for Match {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct EntireFile {
+    #[serde(default)]
     pub messages: Vec<Message>,
+    #[serde(default)]
     pub variables: Vec<VariableMatch>,
     pub source_file: String,
     pub content: String,
@@ -347,6 +353,25 @@ impl EntireFile {
             byte_ranges: byte_range.map(|r| r.to_owned()),
         }
     }
+
+    fn from_file(file: &FileOwner<Tree>) -> Result<Self> {
+        if let Some(source_map) = &file.tree.source_map {
+            let outer_source = source_map.fill_with_inner(&file.tree.source)?;
+
+            Ok(Self::file_to_entire_file(
+                file.name.to_string_lossy().as_ref(),
+                &outer_source,
+                // Exclude the matches, since they aren't reliable yet
+                None,
+            ))
+        } else {
+            Ok(Self::file_to_entire_file(
+                file.name.to_string_lossy().as_ref(),
+                file.tree.outer_source(),
+                file.matches.borrow().byte_ranges.as_ref(),
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -354,6 +379,8 @@ impl EntireFile {
 pub struct Rewrite {
     pub original: Match,
     pub rewritten: EntireFile,
+    /// Deprecated
+    #[serde(default)]
     pub ansi_summary: String,
     pub reason: Option<RewriteReason>,
 }
@@ -367,7 +394,7 @@ impl From<Rewrite> for MatchResult {
 impl Rewrite {
     fn file_to_rewrite<'a>(
         initial: &FileOwner<Tree>,
-        rewrite: &FileOwner<Tree>,
+        rewritten_file: &FileOwner<Tree>,
         language: &impl MarzanoLanguage<'a>,
     ) -> Result<Self> {
         let original = if let Some(ranges) = &initial.matches.borrow().input_matches {
@@ -380,11 +407,7 @@ impl Rewrite {
         } else {
             bail!("cannot have rewrite without matches")
         };
-        let rewritten = EntireFile::file_to_entire_file(
-            rewrite.name.to_string_lossy().as_ref(),
-            &rewrite.tree.source,
-            rewrite.matches.borrow().byte_ranges.as_ref(),
-        );
+        let rewritten = EntireFile::from_file(rewritten_file)?;
         Ok(Rewrite::new(original, rewritten))
     }
 }
@@ -546,8 +569,19 @@ pub struct DoneFile {
     pub has_results: Option<bool>,
     #[serde(skip_serializing)]
     pub file_hash: Option<[u8; 32]>,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, skip_deserializing)]
     pub from_cache: bool,
+}
+
+impl DoneFile {
+    pub fn new(relative_file_path: String) -> Self {
+        Self {
+            relative_file_path,
+            has_results: None,
+            file_hash: None,
+            from_cache: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -589,7 +623,7 @@ pub struct AnalysisLog {
 }
 
 impl AnalysisLog {
-    pub(crate) fn new_error(message: String, file: &str) -> Self {
+    pub fn new_error(message: String, file: &str) -> Self {
         Self {
             level: 280,
             message,
@@ -602,7 +636,7 @@ impl AnalysisLog {
         }
     }
 
-    pub(crate) fn floating_error(message: String) -> Self {
+    pub fn floating_error(message: String) -> Self {
         Self {
             level: 280,
             message,

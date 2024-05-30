@@ -213,7 +213,7 @@ fn test_rewrite(dir: &str, pattern: &str, test: &str) -> Result<()> {
             .join("expected")
             .join(actual_filename);
 
-        std::fs::write(actual_path, &rewrite)?;
+        fs_err::write(actual_path, &rewrite)?;
     }
     assert_eq!(
         rewrite.trim(),
@@ -244,7 +244,7 @@ fn new_files_assertion(
     if !files_path.is_dir() {
         return Ok(());
     }
-    let files = std::fs::read_dir(files_path)?;
+    let files = fs_err::read_dir(files_path)?;
     let count = files.count();
     assert_eq!(
         count,
@@ -262,7 +262,7 @@ fn new_files_assertion(
     for file in files {
         let name = file.file_name();
         let name = name.to_str().unwrap();
-        let content = std::fs::read(file.path())?;
+        let content = fs_err::read(file.path())?;
         let content = String::from_utf8(content)?;
         let content = content.trim();
         let message = format!("pattern result missing file: {}", name);
@@ -311,9 +311,9 @@ fn test_setup(dir: &str, pattern: &str, test: &str) -> Result<(ExecutionResult, 
             test
         )
     })?;
-    let pattern = std::fs::read_to_string(pattern)?;
-    let input = std::fs::read_to_string(input)?;
-    let expected = std::fs::read_to_string(expected).ok();
+    let pattern = fs_err::read_to_string(pattern)?;
+    let input = fs_err::read_to_string(input)?;
+    let expected = fs_err::read_to_string(expected).ok();
     Ok((
         match_pattern_one_file(pattern, "test-file.tsx", &input, lang)?,
         expected,
@@ -4503,7 +4503,7 @@ fn simple_predicate_false() {
 fn test_import_none() {
     let root = get_fixtures_root().unwrap();
     let import_patterns = format!("{}/test_patterns/imports.grit", root.display());
-    let import_patterns = std::fs::read_to_string(import_patterns).unwrap();
+    let import_patterns = fs_err::read_to_string(import_patterns).unwrap();
 
     let pattern = r#"
 
@@ -4555,7 +4555,7 @@ fn rewrite_or_bubble_pattern_argument() {
 fn test_import_just_insert() {
     let root = get_fixtures_root().unwrap();
     let import_patterns = format!("{}/test_patterns/imports.grit", root.display());
-    let import_patterns = std::fs::read_to_string(import_patterns).unwrap();
+    let import_patterns = fs_err::read_to_string(import_patterns).unwrap();
 
     let pattern = r#"
 
@@ -4583,7 +4583,7 @@ fn test_import_just_insert() {
 fn pattern_call_as_rhs() {
     let root = get_fixtures_root().unwrap();
     let import_patterns = format!("{}/test_patterns/imports.grit", root.display());
-    let import_patterns = std::fs::read_to_string(import_patterns).unwrap();
+    let import_patterns = fs_err::read_to_string(import_patterns).unwrap();
 
     let pattern = r#"
         // does not work:
@@ -4623,7 +4623,7 @@ fn pattern_call_as_rhs() {
 fn pattern_call_as_lhs_and_rhs() {
     let root = get_fixtures_root().unwrap();
     let import_patterns = format!("{}/test_patterns/imports.grit", root.display());
-    let import_patterns = std::fs::read_to_string(import_patterns).unwrap();
+    let import_patterns = fs_err::read_to_string(import_patterns).unwrap();
 
     let pattern = r#"
             $x where {
@@ -4647,7 +4647,7 @@ fn pattern_call_as_lhs_and_rhs() {
 fn test_import_all_already_there() {
     let root = get_fixtures_root().unwrap();
     let import_patterns = format!("{}/test_patterns/imports.grit", root.display());
-    let import_patterns = std::fs::read_to_string(import_patterns).unwrap();
+    let import_patterns = fs_err::read_to_string(import_patterns).unwrap();
 
     let pattern = r#"
 
@@ -4679,7 +4679,7 @@ fn test_import_all_already_there() {
 fn test_import_multiple() {
     let root = get_fixtures_root().unwrap();
     let import_patterns = format!("{}/test_patterns/imports.grit", root.display());
-    let import_patterns = std::fs::read_to_string(import_patterns).unwrap();
+    let import_patterns = fs_err::read_to_string(import_patterns).unwrap();
 
     let pattern = r#"
 
@@ -11953,6 +11953,278 @@ fn trailing_comma_import() {
 }
 
 #[test]
+fn trailing_comma_import_from_python() {
+    run_test_expected({
+        TestArgExpected {
+            pattern: r#"
+                |language python
+                |
+                |`foo` => .
+                |"#
+            .trim_margin()
+            .unwrap(),
+            source: r#"
+                |from somewhere import this, foo
+                |from start import foo, fine
+                |from middle import this, foo, more
+                |"#
+            .trim_margin()
+            .unwrap(),
+            // Don't worry about formatting, just check that the trailing comma is removed
+            expected: r#"
+                |from somewhere import this
+                |from start import  fine
+                |from middle import this,  more
+                |"#
+            .trim_margin()
+            .unwrap(),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn trailing_comma_import_from_python_with_alias() {
+    run_test_expected({
+        TestArgExpected {
+            pattern: r#"
+                |language python
+                |
+                |aliased_import(name=contains `foo`) => .
+                |"#
+            .trim_margin()
+            .unwrap(),
+            source: r#"
+                |from somewhere import this as Sam, foo as Bob
+                |from start import foo as Bob, fine
+                |from middle import this, foo as Bob, more
+                |"#
+            .trim_margin()
+            .unwrap(),
+            // Don't worry about formatting, just check that the trailing comma is removed
+            expected: r#"
+                |from somewhere import this as Sam
+                |from start import  fine
+                |from middle import this,  more
+                |"#
+            .trim_margin()
+            .unwrap(),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn python_orphaned_from_imports() {
+    run_test_expected({
+        TestArgExpected {
+            pattern: r#"
+                |language python
+                |
+                |pattern import_from($source, $names) {
+                |    import_from_statement(name=$names, module_name=dotted_name(name=$source)),
+                |}
+                |pattern find_replace_imports($list) {
+                |or {
+                |    import_from($source, $names) as $anchor where {
+                |    $list <: some bubble($source, $names, $anchor) [$from_package, $from_name, $to_package, $to_name] where {
+                |        $source <: includes $from_package,
+                |        // We might need to preserve an alias here
+                |        $replacement_name = $to_name,
+                |        // Did we find at least one true case where the name matched?
+                |        $has_target = false,
+                |        $has_other = false,
+                |
+                |        // Look at each name in a loop
+                |        $names <: some bubble($from_name, $has_other, $has_target, $replacement_name, $to_name) $this_name where {
+                |        or {
+                |            $this_name <: aliased_import(name=contains $from_name, $alias) => . where {
+                |            $replacement_name = `$to_name as $alias`,
+                |            $has_target = true
+                |            },
+                |            $this_name <: contains `$from_name` => . where $has_target = true,
+                |            $has_other = true,
+                |        }
+                |        },
+                |        $has_target <: true,
+                |        if ($has_other <: true) {
+                |        $anchor += `\nfrom $to_package import $replacement_name`
+                |        } else {
+                |        $anchor => `from $to_package import $replacement_name`
+                |        }
+                |    }
+                |    },
+                |    `import $name` as $anchor where {
+                |    // Split the name into its constituent parts
+                |    $name <: dotted_name(name=$name_parts),
+                |    $target = $name_parts,
+                |    $list <: some bubble($target, $anchor) [$from_package, $from_name, $to_package, $to_name] where {
+                |        $prefix = split($from_package, "."),
+                |        $prefix += $from_name,
+                |        // TODO: extract into a universal function
+                |        $index = 0,
+                |        $prefix <: every bubble($target, $prefix, $index) $current where {
+                |        if ($prefix[$index] <: not undefined) {
+                |            $target[$index] <: $prefix[$index]
+                |        },
+                |        $index += 1
+                |        },
+                |        /// Ok, we found an overlap
+                |        $anchor => `import $to_package.$to_name`
+                |    }
+                |    }
+                |}
+                |}
+                |find_replace_imports([
+                |  [`somewhere`, `foo`, `other`, `food`],
+                |  [`somewhere`, `bar`, `other`, `ice`],
+                |  [`online`, `dragon`, `myth`, `dragon`],
+                |  [`online`, `dungeon`, `game`, `dungeon`],
+                |  [`langchain.chains.graph_qa.cypher_utils`, `CypherQueryCorrector`, `lcn`, `CypherQueryCorrector`],
+                |  [`langchain.chains.graph_qa.cypher_utils`, `Schema`, `lcn`, `Schema`],
+                |])
+                |"#
+            .trim_margin()
+            .unwrap(),
+            source: r#"
+                |from somewhere import (
+                |  foo,
+                |  bar
+                |)
+                |from nice import ice
+                |from online import dragon, dungeon
+                |
+                |# problematic
+                |cypher = cypher_response.invoke({"question": "Who played in Casino movie?"})
+                |cypher
+                |from langchain.chains.graph_qa.cypher_utils import CypherQueryCorrector, Schema
+                |# Cypher validation tool for relationship directions
+                |corrector_schema = [
+                |    Schema(el["start"], el["type"], el["end"])
+                |    for el in graph.structured_schema.get("relationships")
+                |]
+                |
+                |# leave this alone
+                |from langchain.chains.query_constructor.ir import (
+                |   Comparator,
+                |   Comparison,
+                |    Operation,
+                |    Operator,
+                |    StructuredQuery,
+                |)
+                |"#
+            .trim_margin()
+            .unwrap(),
+            // Don't worry about formatting, just check that the trailing comma is removed
+            expected: r#"
+                |from other import food
+                |
+                |from other import ice
+                |from nice import ice
+                |
+                |
+                |from myth import dragon
+                |
+                |from game import dungeon
+                |
+                |# problematic
+                |cypher = cypher_response.invoke({"question": "Who played in Casino movie?"})
+                |cypher
+                |
+                |
+                |from lcn import CypherQueryCorrector
+                |
+                |from lcn import Schema
+                |# Cypher validation tool for relationship directions
+                |corrector_schema = [
+                |    Schema(el["start"], el["type"], el["end"])
+                |    for el in graph.structured_schema.get("relationships")
+                |]
+                |
+                |# leave this alone
+                |from langchain.chains.query_constructor.ir import (
+                |   Comparator,
+                |   Comparison,
+                |    Operation,
+                |    Operator,
+                |    StructuredQuery,
+                |)
+                |"#
+            .trim_margin()
+            .unwrap(),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn python_simple_orphan_from() {
+    run_test_expected({
+        TestArgExpected {
+            pattern: r#"
+                |language python
+                |
+                |`something` => .
+                |"#
+            .trim_margin()
+            .unwrap(),
+            source: r#"
+                |from somewhere import something
+                |print("hello")
+                |"#
+            .trim_margin()
+            .unwrap(),
+            // Don't worry about formatting, just check that the trailing comma is removed
+            expected: r#"
+                |print("hello")
+                |"#
+            .trim_margin()
+            .unwrap(),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn python_multiline_removal_from() {
+    run_test_expected({
+        TestArgExpected {
+            pattern: r#"
+                |language python
+                |
+                |or {`CypherQueryCorrector` => ., `Schema` => .}
+                |"#
+            .trim_margin()
+            .unwrap(),
+            source: r#"
+                |# Somehow this causes problems
+                |cypher_template = """Based on the Neo4j graph schema below, write a Cypher query that would answer the user's question:
+                |{wattenberg}
+                |Cypher query:"""
+                |
+                |from langchain.chains.graph_qa.cypher_utils import CypherQueryCorrector, Schema
+                |print("hello")
+                |"#
+            .trim_margin()
+            .unwrap(),
+            // Don't worry about formatting, just check that the trailing comma is removed
+            expected: r#"
+                |# Somehow this causes problems
+                |cypher_template = """Based on the Neo4j graph schema below, write a Cypher query that would answer the user's question:
+                |{wattenberg}
+                |Cypher query:"""
+                |
+                |
+                |print("hello")
+                |"#
+            .trim_margin()
+            .unwrap(),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
 fn yaml_string() {
     run_test_match({
         TestArg {
@@ -14671,6 +14943,43 @@ fn ruby_array_global() {
             .unwrap(),
             expected: r#"
                 |person = ["replaced", 2, 3, 2, 3]
+                |"#
+            .trim_margin()
+            .unwrap(),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn or_file() {
+    run_test_expected({
+        TestArgExpected {
+            pattern: r#"
+                |language js
+                |
+                |or {
+                |   bubble file($body) where {
+                |       $body <: contains `i` => .
+                |   },
+                |   bubble file($body) where {
+                |       $body <: contains `1` => .
+                |   }
+                |}
+                |"#
+            .trim_margin()
+            .unwrap(),
+            source: r#"
+                |var increment = function (i) {
+                |   return i + 1;
+                |};
+                |"#
+            .trim_margin()
+            .unwrap(),
+            expected: r#"
+                |var increment = function () {
+                |   return  + 1;
+                |};
                 |"#
             .trim_margin()
             .unwrap(),

@@ -1,13 +1,16 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 use indicatif::MultiProgress;
-use marzano_gritmodule::config::GritPatternTestInfo;
+use marzano_gritmodule::config::{
+    init_config_from_path, init_global_grit_modules, GritPatternTestInfo,
+};
 use marzano_gritmodule::fetcher::KeepFetcherKind;
 use marzano_gritmodule::patterns_directory::PatternsDirectory;
 use marzano_gritmodule::searcher::find_grit_modules_dir;
 use marzano_gritmodule::utils::is_pattern_name;
-use marzano_messenger::emit::ApplyDetails;
+use marzano_messenger::emit::{ApplyDetails, VisibilityLevels};
 use serde::{Deserialize, Serialize};
+use std::env::current_dir;
 use std::io::{stdin, Read};
 use std::path::Path;
 use std::path::PathBuf;
@@ -21,7 +24,6 @@ use super::super::analytics::AnalyticsArgs;
 use super::apply_pattern::{run_apply_pattern, ApplyPatternArgs};
 use super::check::{run_check, CheckArg};
 use super::filters::SharedFilterArgs;
-use super::init::{init_config_from_cwd, init_global_grit_modules};
 use super::list::ListArgs;
 use super::parse::{run_parse, ParseInput};
 use super::patterns::PatternsTestArgs;
@@ -91,6 +93,14 @@ pub enum PlumbingArgs {
         #[command(flatten)]
         shared_args: SharedPlumbingArgs,
     },
+    /// Run a workflow
+    #[cfg(feature = "workflows_v2")]
+    Run {
+        #[command(flatten)]
+        shared_args: SharedPlumbingArgs,
+        /// Workflow definition file
+        definition: String,
+    },
 }
 
 fn read_input(shared_args: &SharedPlumbingArgs) -> Result<String> {
@@ -135,7 +145,7 @@ pub(crate) async fn run_plumbing(
                 PatternsDirectory::new()
             } else {
                 let path = PathBuf::from(input.paths.first().unwrap());
-                init_config_from_cwd::<KeepFetcherKind>(path.clone(), false).await?;
+                init_config_from_path::<KeepFetcherKind>(path.clone(), false).await?;
                 get_grit_files_from(Some(path)).await?
             };
             let raw_name = input.pattern_body.trim_end_matches("()");
@@ -260,16 +270,53 @@ pub(crate) async fn run_plumbing(
 
             let cwd = std::env::current_dir()?;
             let libs = get_grit_files_from(Some(cwd)).await?;
-            get_marzano_pattern_test_results(
+            let res = get_marzano_pattern_test_results(
                 patterns,
                 &libs,
-                PatternsTestArgs {
+                &PatternsTestArgs {
                     update: false,
                     verbose: false,
+                    watch: false,
                     filter: None,
                     exclude: vec![],
                 },
                 parent.into(),
+            )
+            .await?;
+            match res {
+                super::patterns_test::AggregatedTestResult::SomeFailed(message) => {
+                    Err(anyhow::anyhow!(message))
+                }
+                super::patterns_test::AggregatedTestResult::AllPassed => Ok(()),
+            }
+        }
+        #[cfg(feature = "workflows_v2")]
+        PlumbingArgs::Run {
+            shared_args,
+            definition,
+        } => {
+            let buffer = read_input(&shared_args)?;
+
+            let current_dir = current_dir()?;
+
+            let custom_workflow = marzano_gritmodule::searcher::find_workflow_file_from(
+                current_dir.clone(),
+                &definition,
+            )
+            .await
+            .unwrap();
+
+            super::apply_migration::run_apply_migration(
+                custom_workflow,
+                vec![current_dir],
+                None,
+                super::apply_migration::ApplyMigrationArgs {
+                    input: Some(buffer),
+                    remote: false,
+                    verbose: true,
+                },
+                &parent,
+                VisibilityLevels::default(),
             )
             .await
         }

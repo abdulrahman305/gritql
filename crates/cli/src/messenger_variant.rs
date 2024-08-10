@@ -1,7 +1,9 @@
 use anyhow::{bail, Result};
 use marzano_core::api::AnalysisLog;
 use marzano_messenger::{
-    emit::Messager, output_mode::OutputMode, workflows::PackagedWorkflowOutcome,
+    emit::{FlushableMessenger, Messager, VisibilityLevels},
+    output_mode::OutputMode,
+    workflows::{PackagedWorkflowOutcome, WorkflowMessenger},
 };
 use std::{
     io::{self, Write},
@@ -14,6 +16,8 @@ use cli_server::combined::CombinedMessenger;
 use cli_server::pubsub::GooglePubSubMessenger;
 #[cfg(feature = "remote_redis")]
 use cli_server::redis::RedisMessenger;
+#[cfg(feature = "server")]
+use cli_server::workflows::RemoteWorkflowMessenger;
 
 use crate::{
     flags::OutputFormat,
@@ -35,6 +39,20 @@ pub enum MessengerVariant<'a> {
 }
 
 impl<'a> Messager for MessengerVariant<'a> {
+    fn get_min_level(&self) -> VisibilityLevels {
+        match self {
+            MessengerVariant::Formatted(m) => m.get_min_level(),
+            MessengerVariant::Transformed(m) => m.get_min_level(),
+            MessengerVariant::JsonLine(m) => m.get_min_level(),
+            #[cfg(feature = "remote_redis")]
+            MessengerVariant::Redis(m) => m.get_min_level(),
+            #[cfg(feature = "remote_pubsub")]
+            MessengerVariant::GooglePubSub(m) => m.get_min_level(),
+            #[cfg(feature = "server")]
+            MessengerVariant::Combined(m) => m.get_min_level(),
+        }
+    }
+
     fn raw_emit(&mut self, message: &marzano_core::api::MatchResult) -> anyhow::Result<()> {
         match self {
             MessengerVariant::Formatted(m) => m.raw_emit(message),
@@ -46,6 +64,20 @@ impl<'a> Messager for MessengerVariant<'a> {
             MessengerVariant::GooglePubSub(m) => m.raw_emit(message),
             #[cfg(feature = "server")]
             MessengerVariant::Combined(m) => m.raw_emit(message),
+        }
+    }
+
+    fn emit_log(&mut self, log: &marzano_messenger::SimpleLogMessage) -> anyhow::Result<()> {
+        match self {
+            MessengerVariant::Formatted(m) => m.emit_log(log),
+            MessengerVariant::Transformed(m) => m.emit_log(log),
+            MessengerVariant::JsonLine(m) => m.emit_log(log),
+            #[cfg(feature = "remote_redis")]
+            MessengerVariant::Redis(m) => m.emit_log(log),
+            #[cfg(feature = "remote_pubsub")]
+            MessengerVariant::GooglePubSub(m) => m.emit_log(log),
+            #[cfg(feature = "server")]
+            MessengerVariant::Combined(m) => m.emit_log(log),
         }
     }
 
@@ -88,6 +120,55 @@ impl<'a> Messager for MessengerVariant<'a> {
             MessengerVariant::GooglePubSub(m) => m.finish_workflow(outcome),
             #[cfg(feature = "server")]
             MessengerVariant::Combined(m) => m.finish_workflow(outcome),
+        }
+    }
+}
+
+impl<'a> WorkflowMessenger for MessengerVariant<'a> {
+    fn save_metadata(
+        &mut self,
+        message: &marzano_messenger::workflows::SimpleWorkflowMessage,
+    ) -> anyhow::Result<()> {
+        match self {
+            MessengerVariant::Formatted(_)
+            | MessengerVariant::Transformed(_)
+            | MessengerVariant::JsonLine(_) => {
+                // These are local, so no need to save metadata
+                log::debug!(
+                    "Skipping save_metadata for local messenger: {} {:?}",
+                    message.kind,
+                    message.message
+                );
+                Ok(())
+            }
+            #[cfg(feature = "remote_redis")]
+            MessengerVariant::Redis(m) => m.save_metadata(message),
+            #[cfg(feature = "remote_pubsub")]
+            MessengerVariant::GooglePubSub(m) => m.save_metadata(message),
+            #[cfg(feature = "server")]
+            MessengerVariant::Combined(m) => m.save_metadata(message),
+        }
+    }
+
+    fn emit_from_workflow(
+        &mut self,
+        message: &marzano_messenger::workflows::WorkflowMatchResult,
+    ) -> anyhow::Result<()> {
+        match self {
+            MessengerVariant::Formatted(_)
+            | MessengerVariant::Transformed(_)
+            | MessengerVariant::JsonLine(_) => {
+                // For local emitters,, we will also apply rewrites
+                self.emit(&message.result)?;
+                self.apply_rewrite(&message.result)?;
+                Ok(())
+            }
+            #[cfg(feature = "remote_redis")]
+            MessengerVariant::Redis(m) => m.emit_from_workflow(message),
+            #[cfg(feature = "remote_pubsub")]
+            MessengerVariant::GooglePubSub(m) => m.emit_from_workflow(message),
+            #[cfg(feature = "server")]
+            MessengerVariant::Combined(m) => m.emit_from_workflow(message),
         }
     }
 }
@@ -141,8 +222,10 @@ impl<'a> MessengerVariant<'a> {
             _ => None,
         }
     }
+}
 
-    pub async fn flush(&mut self) -> anyhow::Result<()> {
+impl FlushableMessenger for MessengerVariant<'_> {
+    async fn flush(&mut self) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "remote_redis")]
             MessengerVariant::Redis(ref mut redis) => redis.flush().await,
@@ -165,6 +248,7 @@ pub async fn create_emitter<'a>(
     interactive: bool,
     pattern: Option<&str>,
     _root_path: Option<&PathBuf>,
+    min_level: VisibilityLevels,
 ) -> Result<MessengerVariant<'a>> {
     let writer: Option<Box<dyn Write + Send>> = if let Some(output_file) = output_file {
         let file = fs_err::File::create(output_file)?;
@@ -180,6 +264,7 @@ pub async fn create_emitter<'a>(
             mode,
             interactive,
             pattern.unwrap_or_default().to_string(),
+            min_level,
         )
         .into(),
         OutputFormat::Json => {
@@ -187,8 +272,11 @@ pub async fn create_emitter<'a>(
         }
         OutputFormat::Transformed => TransformedMessenger::new(writer).into(),
         OutputFormat::Jsonl => {
-            let jsonl =
-                JSONLineMessenger::new(writer.unwrap_or_else(|| Box::new(io::stdout())), mode);
+            let jsonl = JSONLineMessenger::new(
+                writer.unwrap_or_else(|| Box::new(io::stdout())),
+                mode,
+                min_level,
+            );
             jsonl.into()
         }
         #[cfg(feature = "remote_redis")]

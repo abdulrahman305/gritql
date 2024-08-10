@@ -9,10 +9,10 @@ use crate::{
     marzano_resolved_pattern::{MarzanoFile, MarzanoResolvedPattern},
     pattern_compiler::compiler::VariableLocations,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use grit_pattern_matcher::{
     constants::{GLOBAL_VARS_SCOPE_INDEX, NEW_FILES_INDEX},
-    context::QueryContext,
+    context::{QueryContext, StaticDefinitions},
     file_owners::FileOwners,
     pattern::{
         FilePtr, FileRegistry, GritFunctionDefinition, Matcher, Pattern, PatternDefinition,
@@ -34,10 +34,11 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use sha2::{Digest, Sha256};
 
+use crate::api::FileMatchResult;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Receiver, Sender},
 };
 use std::{fmt::Debug, str::FromStr};
 use tracing::{event, Level};
@@ -55,7 +56,7 @@ pub struct Problem {
     pub hash: [u8; 32],
     pub name: Option<String>,
     pub(crate) variables: VariableLocations,
-    pub(crate) pattern_definitions: Vec<PatternDefinition<MarzanoQueryContext>>,
+    pub pattern_definitions: Vec<PatternDefinition<MarzanoQueryContext>>,
     pub(crate) predicate_definitions: Vec<PredicateDefinition<MarzanoQueryContext>>,
     pub(crate) function_definitions: Vec<GritFunctionDefinition<MarzanoQueryContext>>,
     pub(crate) foreign_function_definitions: Vec<ForeignFunctionDefinition>,
@@ -64,6 +65,19 @@ pub struct Problem {
 impl Problem {
     pub fn compiled_vars(&self) -> Vec<VariableMatch> {
         self.variables.compiled_vars(&self.tree.source)
+    }
+
+    pub fn definitions(&self) -> StaticDefinitions<'_, MarzanoQueryContext> {
+        let mut defs = StaticDefinitions::new(
+            &self.pattern_definitions,
+            &self.predicate_definitions,
+            &self.function_definitions,
+        );
+        // We use the first 3 indexes for auto-wrap stuff in production
+        if self.pattern_definitions.len() >= 3 {
+            defs.skippable_indexes = vec![0, 1, 2];
+        }
+        defs
     }
 }
 
@@ -338,6 +352,7 @@ impl Problem {
         results
     }
 
+    /// Given a vec of paths, execute the problem on each path and stream the results
     pub fn execute_paths_streaming(
         &self,
         files: Vec<PathBuf>,
@@ -346,6 +361,77 @@ impl Problem {
         cache: &impl GritCache,
     ) {
         self.execute_shared(files, context, tx, cache)
+    }
+
+    /// Given an input channel and an output channel, chain the input channel to the output channel
+    ///
+    /// Files that match from the input channel are executed by this pattern
+    /// All other message types are simply forwarded to the output channel
+    ///
+    pub fn execute_streaming_relay(
+        &self,
+        incoming_rx: Receiver<Vec<MatchResult>>,
+        context: &ExecutionContext,
+        outgoing_tx: Sender<Vec<MatchResult>>,
+        _cache: &impl GritCache,
+    ) -> Result<()> {
+        if self.is_multifile {
+            bail!("Streaming is not supported for multifile patterns");
+        }
+
+        #[cfg(feature = "grit_tracing")]
+        let parent_span = tracing::span!(Level::INFO, "execute_shared_body",).entered();
+        #[cfg(feature = "grit_tracing")]
+        let parent_cx = parent_span.context();
+
+        rayon::scope(|s| {
+            #[cfg(feature = "grit_tracing")]
+            let grouped_ctx = parent_cx;
+
+            s.spawn(move |_| {
+                #[cfg(feature = "grit_tracing")]
+                let task_span = tracing::info_span!("apply_file_inner").entered();
+                #[cfg(feature = "grit_tracing")]
+                task_span.set_parent(grouped_ctx);
+
+                event!(Level::INFO, "spawn execute_shared_body");
+
+                incoming_rx.iter().for_each(|res| {
+                    let mut paths = Vec::new();
+
+                    for m in res.into_iter() {
+                        match m {
+                            MatchResult::Match(m) => {
+                                paths.push(PathBuf::from(m.file_name()));
+                            }
+                            MatchResult::PatternInfo(_)
+                            | MatchResult::AllDone(_)
+                            | MatchResult::InputFile(_)
+                            | MatchResult::AnalysisLog(_)
+                            | MatchResult::DoneFile(_) => {
+                                outgoing_tx.send(vec![m]).unwrap();
+                            }
+                            MatchResult::Rewrite(_)
+                            | MatchResult::CreateFile(_)
+                            | MatchResult::RemoveFile(_) => {
+                                outgoing_tx
+                                    .send(vec![
+                                    m,
+                                    MatchResult::AnalysisLog(AnalysisLog::floating_error(
+                                        "Streaming does not support rewrites, creates, or removes"
+                                            .to_string(),
+                                    )),
+                                ])
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    self.execute_shared(paths, context, outgoing_tx.clone(), &NullCache::new());
+                });
+            })
+        });
+
+        Ok(())
     }
 
     #[cfg_attr(feature = "grit_tracing", tracing::instrument(skip_all))]
@@ -474,7 +560,7 @@ impl Problem {
             .execute(&binding, &mut state, &context, &mut user_logs)?
         {
             for file in state.files.files() {
-                if let Some(result) = MatchResult::file_to_match_result(file, &self.language)? {
+                if let Some(result) = MatchResult::file_to_match_result(file)? {
                     results.push(result)
                 }
             }

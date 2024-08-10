@@ -4,6 +4,7 @@ use axoupdater::{AxoUpdater, ReleaseSource, ReleaseSourceType, Version};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use colored::Colorize;
 use futures_util::StreamExt;
+use indicatif::ProgressBar;
 use log::info;
 use marzano_auth::info::AuthInfo;
 use marzano_gritmodule::config::REPO_CONFIG_DIR_NAME;
@@ -57,8 +58,6 @@ impl AllApp {
     fn from_supported_app(app: SupportedApp) -> Self {
         match app {
             SupportedApp::Marzano => AllApp::Marzano,
-            SupportedApp::Cli => AllApp::Cli,
-            SupportedApp::Timekeeper => AllApp::Timekeeper,
             #[cfg(feature = "workflows_v2")]
             SupportedApp::WorkflowRunner => AllApp::WorkflowRunner,
             SupportedApp::Gouda => AllApp::Gouda,
@@ -69,9 +68,7 @@ impl AllApp {
 // Allowed modern apps
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, clap::ValueEnum)]
 pub enum SupportedApp {
-    Timekeeper,
     Marzano,
-    Cli,
     Gouda,
     #[cfg(feature = "workflows_v2")]
     WorkflowRunner,
@@ -85,9 +82,7 @@ impl SupportedApp {
 
     pub fn get_base_name(&self) -> String {
         match self {
-            SupportedApp::Timekeeper => "timekeeper".to_string(),
             SupportedApp::Marzano => "marzano".to_string(),
-            SupportedApp::Cli => "cli".to_string(),
             SupportedApp::Gouda => "gouda".to_string(),
             #[cfg(feature = "workflows_v2")]
             SupportedApp::WorkflowRunner => "workflow_runner".to_string(),
@@ -96,9 +91,7 @@ impl SupportedApp {
 
     fn get_env_name(&self) -> String {
         match self {
-            SupportedApp::Timekeeper => "GRIT_TIMEKEEPER_PATH".to_string(),
             SupportedApp::Marzano => "GRIT_MARZANO_PATH".to_string(),
-            SupportedApp::Cli => "GRIT_CLI_PATH".to_string(),
             SupportedApp::Gouda => "GRIT_GOUDA_PATH".to_string(),
             #[cfg(feature = "workflows_v2")]
             SupportedApp::WorkflowRunner => "GRIT_WORKFLOW_RUNNER".to_string(),
@@ -106,17 +99,11 @@ impl SupportedApp {
     }
 
     fn get_bin_name(&self) -> String {
-        match self {
-            SupportedApp::Timekeeper => "temporalite".to_string(),
-            _ => format!("{}-{}", self.get_base_name(), get_client_os()),
-        }
+        format!("{}-{}", self.get_base_name(), get_client_os())
     }
 
     fn get_fallback_bin_name(&self) -> String {
-        match self {
-            SupportedApp::Timekeeper => "temporalite".to_string(),
-            _ => self.get_base_name().to_string(),
-        }
+        self.get_base_name().to_string()
     }
 
     fn get_file_name(&self, os: &str, arch: &str) -> String {
@@ -127,8 +114,6 @@ impl SupportedApp {
     pub fn from_all_app(app: AllApp) -> Option<Self> {
         match app {
             AllApp::Marzano => Some(SupportedApp::Marzano),
-            AllApp::Cli => Some(SupportedApp::Cli),
-            AllApp::Timekeeper => Some(SupportedApp::Timekeeper),
             AllApp::Gouda => Some(SupportedApp::Gouda),
             #[cfg(feature = "workflows_v2")]
             AllApp::WorkflowRunner => Some(SupportedApp::WorkflowRunner),
@@ -158,6 +143,7 @@ struct Manifest {
     last_checked_update: Option<NaiveDateTime>,
     installation_id: Option<Uuid>,
     access_token: Option<String>,
+    refresh_token: Option<String>,
 }
 
 async fn read_manifest(manifest_path: &PathBuf) -> Result<Manifest> {
@@ -183,6 +169,7 @@ pub struct Updater {
     last_checked_update: Option<NaiveDateTime>,
     pub installation_id: Uuid,
     access_token: Option<String>,
+    refresh_token: Option<String>,
 }
 
 impl Updater {
@@ -213,6 +200,7 @@ impl Updater {
                 last_checked_update: manifest.last_checked_update,
                 installation_id: manifest.installation_id.unwrap_or_else(Uuid::new_v4),
                 access_token: manifest.access_token,
+                refresh_token: manifest.refresh_token,
             });
         }
 
@@ -230,6 +218,7 @@ impl Updater {
             last_checked_update: None,
             installation_id: Uuid::new_v4(),
             access_token: None,
+            refresh_token: None,
         };
         Ok(updater)
     }
@@ -238,8 +227,6 @@ impl Updater {
     pub fn get_apps() -> Vec<SupportedApp> {
         vec![
             SupportedApp::Marzano,
-            SupportedApp::Cli,
-            SupportedApp::Timekeeper,
             SupportedApp::Gouda,
             #[cfg(feature = "workflows_v2")]
             SupportedApp::WorkflowRunner,
@@ -445,6 +432,7 @@ impl Updater {
             last_checked_update: self.last_checked_update,
             installation_id: Some(self.installation_id),
             access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
         };
         let manifest_string = serde_json::to_string_pretty(&manifest)?;
         manifest_file.write_all(manifest_string.as_bytes()).await?;
@@ -452,8 +440,11 @@ impl Updater {
     }
 
     /// Save a new auth token to the manifest
-    pub async fn save_token(&mut self, token: &str) -> Result<()> {
-        self.access_token = Some(token.to_string());
+    pub async fn save_token(&mut self, auth: &AuthInfo) -> Result<()> {
+        self.access_token = Some(auth.access_token.clone());
+        if auth.refresh_token.is_some() {
+            self.refresh_token = auth.refresh_token.clone();
+        }
         self.dump().await?;
         Ok(())
     }
@@ -464,6 +455,7 @@ impl Updater {
             bail!("You are not authenticated.");
         }
         self.access_token = None;
+        self.refresh_token = None;
         self.dump().await?;
         Ok(())
     }
@@ -475,20 +467,40 @@ impl Updater {
             return Some(auth);
         }
         if let Some(token) = &self.access_token {
-            return Some(AuthInfo::new(token.to_string()));
+            let mut info = AuthInfo::new(token.to_string());
+            if let Some(refresh_token) = &self.refresh_token {
+                info.refresh_token = Some(refresh_token.to_string());
+            }
+            return Some(info);
         }
         None
     }
 
-    pub fn get_valid_auth(&self) -> Result<AuthInfo> {
+    pub async fn refresh_auth(&mut self) -> Result<AuthInfo> {
+        let Some(auth) = self.get_auth() else {
+            bail!("Not authenticated");
+        };
+
+        let pg = ProgressBar::new_spinner();
+        pg.set_message("Refreshing auth...");
+        let refreshed_auth = marzano_auth::auth0::refresh_token(&auth).await?;
+        self.save_token(&refreshed_auth).await?;
+
+        pg.finish_and_clear();
+        Ok(refreshed_auth)
+    }
+
+    /// Get a valid auth token, refreshing if necessary
+    pub async fn get_valid_auth(&mut self) -> Result<AuthInfo> {
         let auth = self.get_auth();
-        if let Some(auth) = auth {
-            if auth.is_expired()? {
-                bail!("Auth token expired");
-            }
-            return Ok(auth);
+        let Some(auth) = auth else {
+            bail!("Not authenticated, please run `grit auth login` to authenticate.");
+        };
+        if auth.is_expired()? {
+            let refreshed = self.refresh_auth().await?;
+            return Ok(refreshed);
         }
-        bail!("Not authenticated");
+        Ok(auth)
     }
 
     async fn download_artifact(&self, app: SupportedApp, artifact_url: String) -> Result<PathBuf> {
@@ -844,13 +856,11 @@ mod tests {
     #[tokio::test]
     async fn test_filenames() -> Result<()> {
         let marzano = SupportedApp::Marzano;
-        let cli = SupportedApp::Cli;
 
         assert_eq!(
             marzano.get_file_name("macos", "arm64"),
             "marzano-macos-arm64"
         );
-        assert_eq!(cli.get_file_name("macos", "arm64"), "cli-macos-arm64");
 
         Ok(())
     }
@@ -886,13 +896,13 @@ mod tests {
         assert_eq!(marzano_version, "0.1.0-alpha.1689744085325");
 
         // Get the release date of the cli binary
-        let cli_release_date = updater._get_app_release_date(SupportedApp::Cli)?;
+        let marzano_release_date = updater._get_app_release_date(SupportedApp::Marzano)?;
         assert_eq!(
-            cli_release_date,
+            marzano_release_date,
             DateTime::<Utc>::from_naive_utc_and_offset(
-                NaiveDate::from_ymd_opt(2023, 7, 12)
+                NaiveDate::from_ymd_opt(2023, 7, 19)
                     .unwrap()
-                    .and_hms_opt(5, 2, 9)
+                    .and_hms_milli_opt(5, 21, 25, 325)
                     .unwrap(),
                 Utc
             ),

@@ -1,5 +1,6 @@
 use crate::flags::GlobalFormatFlags;
 use crate::{flags::OutputFormat, messenger_variant::create_emitter};
+use marzano_messenger::emit::FlushableMessenger;
 
 #[cfg(not(feature = "workflows_v2"))]
 use anyhow::bail;
@@ -21,7 +22,7 @@ pub struct ApplyMigrationArgs {
         help_heading = "Workflow options",
         help = "JSON input parameter to pass to the workflow"
     )]
-    input: Option<String>,
+    pub(crate) input: Option<String>,
     #[clap(
         long,
         help_heading = "Workflow options",
@@ -30,7 +31,7 @@ pub struct ApplyMigrationArgs {
     pub(crate) remote: bool,
     /// Print verbose output
     #[clap(long)]
-    verbose: bool,
+    pub(crate) verbose: bool,
 }
 
 impl ApplyMigrationArgs {
@@ -63,9 +64,8 @@ pub(crate) async fn run_apply_migration(
     ranges: Option<Vec<marzano_util::diff::FileDiff>>,
     arg: ApplyMigrationArgs,
     flags: &GlobalFormatFlags,
+    min_level: marzano_messenger::emit::VisibilityLevels,
 ) -> Result<()> {
-    use crate::workflows::display_workflow_outcome;
-
     let input = arg.get_payload()?;
 
     let format = OutputFormat::from(flags);
@@ -76,6 +76,7 @@ pub(crate) async fn run_apply_migration(
         false,
         None,
         None,
+        min_level,
     )
     .await?;
 
@@ -93,8 +94,9 @@ pub(crate) async fn run_apply_migration(
     )
     .await?;
 
+    // Note the workflow may have already emitted its own conclusion - this is a fallback
     emitter.finish_workflow(&outcome)?;
     emitter.flush().await?;
 
-    display_workflow_outcome(outcome)
+    Ok(())
 }

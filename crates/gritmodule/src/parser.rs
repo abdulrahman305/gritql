@@ -7,8 +7,9 @@ use crate::{
     config::{ModuleGritPattern, REPO_CONFIG_DIR_NAME},
     dot_grit::get_patterns_from_grit,
     fetcher::ModuleRepo,
-    markdown::get_patterns_from_md,
+    markdown::{get_patterns_from_md, GritDefinitionOverrides},
     searcher::find_repo_root_from,
+    yaml::get_patterns_from_yaml,
 };
 use anyhow::{Context, Result};
 use marzano_util::rich_path::RichFile;
@@ -22,6 +23,8 @@ pub enum PatternFileExt {
     Grit,
     #[serde(rename = "markdown")]
     Md,
+    #[serde(rename = "yaml")]
+    Yaml,
 }
 
 impl fmt::Display for PatternFileExt {
@@ -29,6 +32,7 @@ impl fmt::Display for PatternFileExt {
         match self {
             PatternFileExt::Grit => write!(f, "grit"),
             PatternFileExt::Md => write!(f, "md"),
+            PatternFileExt::Yaml => write!(f, "yaml"),
         }
     }
 }
@@ -39,15 +43,17 @@ impl PatternFileExt {
         match ext {
             "grit" => Some(PatternFileExt::Grit),
             "md" => Some(PatternFileExt::Md),
+            "yaml" => Some(PatternFileExt::Yaml),
             _ => None,
         }
     }
 
-    fn get_patterns(
+    async fn get_patterns(
         &self,
         file: &mut RichFile,
         source_module: &Option<ModuleRepo>,
         root: &Option<String>,
+        overrides: GritDefinitionOverrides,
     ) -> Result<Vec<ModuleGritPattern>, anyhow::Error> {
         match self {
             PatternFileExt::Grit => {
@@ -58,10 +64,18 @@ impl PatternFileExt {
                     )
                 })
             }
-            PatternFileExt::Md => {
-                get_patterns_from_md(file, source_module, root).with_context(|| {
+            PatternFileExt::Md => get_patterns_from_md(file, source_module, root, overrides)
+                .with_context(|| {
                     format!(
                         "Failed to parse markdown pattern {}",
+                        extract_relative_file_path(file, root)
+                    )
+                }),
+            PatternFileExt::Yaml => {
+                let res = get_patterns_from_yaml(file, source_module.as_ref(), root, "").await;
+                res.with_context(|| {
+                    format!(
+                        "Failed to parse yaml pattern {}",
                         extract_relative_file_path(file, root)
                     )
                 })
@@ -73,6 +87,7 @@ impl PatternFileExt {
         match self {
             PatternFileExt::Grit => "grit",
             PatternFileExt::Md => "md",
+            PatternFileExt::Yaml => "yaml",
         }
     }
 }
@@ -81,6 +96,7 @@ pub async fn get_patterns_from_file(
     path: PathBuf,
     source_module: Option<ModuleRepo>,
     ext: PatternFileExt,
+    overrides: GritDefinitionOverrides,
 ) -> Result<Vec<ModuleGritPattern>> {
     let repo_root = find_repo_root_from(path.clone()).await?;
     let content = fs::read_to_string(&path).await?;
@@ -88,7 +104,8 @@ pub async fn get_patterns_from_file(
         path: path.to_string_lossy().to_string(),
         content,
     };
-    ext.get_patterns(&mut file, &source_module, &repo_root)
+    ext.get_patterns(&mut file, &source_module, &repo_root, overrides)
+        .await
 }
 
 pub fn extract_relative_file_path(file: &RichFile, root: &Option<String>) -> String {

@@ -2,11 +2,10 @@ use anyhow::anyhow;
 use colored::Colorize;
 use console::style;
 use core::fmt;
-use fs_err::read_to_string;
-use log::info;
+use log::{debug, error, info, warn};
 use marzano_core::api::{
-    AllDone, AnalysisLog, CreateFile, DoneFile, FileMatchResult, InputFile, Match, MatchResult,
-    PatternInfo, RemoveFile, Rewrite,
+    AllDone, AnalysisLog, AnalysisLogLevel, CreateFile, DoneFile, FileMatchResult, InputFile,
+    Match, MatchReason, MatchResult, PatternInfo, RemoveFile, Rewrite,
 };
 use marzano_core::constants::DEFAULT_FILE_NAME;
 use marzano_messenger::output_mode::OutputMode;
@@ -17,7 +16,7 @@ use std::{
 };
 
 use crate::ux::{format_result_diff, indent};
-use marzano_messenger::emit::Messager;
+use marzano_messenger::emit::{Messager, VisibilityLevels};
 
 #[derive(Debug)]
 pub enum FormattedResult {
@@ -138,6 +137,40 @@ pub fn get_human_error(mut log: AnalysisLog, input_pattern: &str) -> String {
     result
 }
 
+/// Print a header for a match, with the path and (maybe) a title/explanation
+pub fn print_file_header(
+    path: &str,
+    reason: &Option<MatchReason>,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    let path_title = path.bold();
+    if let Some(r) = reason {
+        if let Some(title) = &r.title {
+            writeln!(f, "{}: {}", path_title, title)?;
+        } else {
+            writeln!(f, "{}", path_title)?;
+        }
+        if let Some(explanation) = &r.explanation {
+            writeln!(f, "  {}", explanation.italic())?;
+        }
+    } else {
+        writeln!(f, "{}", path_title)?;
+    }
+    Ok(())
+}
+
+fn get_pretty_workflow_message(
+    outcome: &marzano_messenger::workflows::PackagedWorkflowOutcome,
+) -> String {
+    let emoji = match outcome.get_outcome() {
+        marzano_messenger::workflows::OutcomeKind::Success => "✅",
+        marzano_messenger::workflows::OutcomeKind::Failure => "❌",
+        marzano_messenger::workflows::OutcomeKind::Skipped => "⚪️",
+    };
+    let message = outcome.message.as_deref().unwrap_or("Workflow finished");
+    format!("{} {}", emoji, message)
+}
+
 impl fmt::Display for FormattedResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -166,12 +199,12 @@ impl fmt::Display for FormattedResult {
                 Ok(())
             }
             FormattedResult::Match(m) => {
-                let path_title = m.file_name().bold();
-                writeln!(f, "{}", path_title)?;
-                let source = read_to_string(m.file_name());
+                print_file_header(m.file_name(), &m.reason, f)?;
+
+                let source = m.content();
                 match source {
                     Err(e) => {
-                        writeln!(f, "Could not read file: {}", e)?;
+                        writeln!(f, "Could not read flie: {}", e)?;
                         return Ok(());
                     }
                     Ok(source) => {
@@ -233,24 +266,22 @@ impl fmt::Display for FormattedResult {
                         item.original.source_file, item.rewritten.source_file
                     )
                 };
-                let path_title = path_name.bold();
-                writeln!(f, "{}", path_title)?;
+                print_file_header(&path_name, &item.reason, f)?;
+
                 let result: MatchResult = item.clone().into();
                 let diff = format_result_diff(&result, None);
                 write!(f, "{}", diff)?;
                 Ok(())
             }
             FormattedResult::CreateFile(item) => {
-                let path_title = item.file_name().bold();
+                print_file_header(item.file_name(), &item.reason, f)?;
                 let result: MatchResult = item.clone().into();
-                writeln!(f, "{}", path_title)?;
                 let diff = format_result_diff(&result, None);
                 write!(f, "{}", diff)?;
                 Ok(())
             }
             FormattedResult::RemoveFile(item) => {
-                let path_title = item.file_name().bold();
-                writeln!(f, "{}", path_title)?;
+                print_file_header(item.file_name(), &item.reason, f)?;
                 let result: MatchResult = item.clone().into();
                 let diff = format_result_diff(&result, None);
                 write!(f, "{}", diff)?;
@@ -271,6 +302,8 @@ pub struct FormattedMessager<'a> {
     total_rejected: usize,
     total_supressed: usize,
     input_pattern: String,
+    min_level: VisibilityLevels,
+    workflow_done: bool,
 }
 
 impl<'a> FormattedMessager<'_> {
@@ -279,6 +312,7 @@ impl<'a> FormattedMessager<'_> {
         mode: OutputMode,
         interactive: bool,
         input_pattern: String,
+        min_level: VisibilityLevels,
     ) -> FormattedMessager<'a> {
         FormattedMessager {
             writer: writer.map(|w| Arc::new(Mutex::new(w))),
@@ -288,11 +322,17 @@ impl<'a> FormattedMessager<'_> {
             total_rejected: 0,
             total_supressed: 0,
             input_pattern,
+            min_level,
+            workflow_done: false,
         }
     }
 }
 
 impl Messager for FormattedMessager<'_> {
+    fn get_min_level(&self) -> VisibilityLevels {
+        self.min_level
+    }
+
     fn raw_emit(&mut self, message: &MatchResult) -> anyhow::Result<()> {
         if self.interactive && !(self.mode == OutputMode::None) {
             if let MatchResult::AllDone(item) = message {
@@ -341,6 +381,50 @@ impl Messager for FormattedMessager<'_> {
         self.total_supressed += 1;
         Ok(())
     }
+
+    fn finish_workflow(
+        &mut self,
+        outcome: &marzano_messenger::workflows::PackagedWorkflowOutcome,
+    ) -> anyhow::Result<()> {
+        if self.workflow_done {
+            // If we already finished once, short-circuit it
+            return Ok(());
+        }
+
+        if let Some(writer) = &mut self.writer {
+            let mut writer = writer.lock().map_err(|_| anyhow!("Output lock poisoned"))?;
+            writeln!(writer, "{}", get_pretty_workflow_message(outcome))?;
+        } else {
+            log::info!("{}", get_pretty_workflow_message(outcome));
+        }
+
+        self.workflow_done = true;
+
+        Ok(())
+    }
+
+    fn emit_log(&mut self, log: &marzano_messenger::SimpleLogMessage) -> anyhow::Result<()> {
+        if let Some(writer) = &mut self.writer {
+            let mut writer = writer.lock().map_err(|_| anyhow!("Output lock poisoned"))?;
+            writeln!(writer, "[{:?}] {}", log.level, log.message)?;
+        } else {
+            match log.level {
+                AnalysisLogLevel::Debug => {
+                    debug!("{}", log.message);
+                }
+                AnalysisLogLevel::Info => {
+                    info!("{}", log.message);
+                }
+                AnalysisLogLevel::Warn => {
+                    warn!("{}", log.message);
+                }
+                AnalysisLogLevel::Error => {
+                    error!("{}", log.message);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Prints the transformed files themselves, with no metadata
@@ -363,6 +447,10 @@ impl<'a> TransformedMessenger<'_> {
 }
 
 impl Messager for TransformedMessenger<'_> {
+    fn get_min_level(&self) -> VisibilityLevels {
+        VisibilityLevels::Primary
+    }
+
     fn raw_emit(&mut self, message: &MatchResult) -> anyhow::Result<()> {
         match message {
             MatchResult::PatternInfo(_)
@@ -378,18 +466,18 @@ impl Messager for TransformedMessenger<'_> {
                 // Write the file contents to the output
                 if let Some(writer) = &mut self.writer {
                     let mut writer = writer.lock().map_err(|_| anyhow!("Output lock poisoned"))?;
-                    writeln!(writer, "{}", file.rewritten.content)?;
+                    writeln!(writer, "{}", file.content().unwrap_or_default())?;
                 } else {
-                    info!("{}", file.rewritten.content);
+                    info!("{}", file.content().unwrap_or_default());
                 }
             }
             MatchResult::CreateFile(file) => {
                 // Write the file contents to the output
                 if let Some(writer) = &mut self.writer {
                     let mut writer = writer.lock().map_err(|_| anyhow!("Output lock poisoned"))?;
-                    writeln!(writer, "{}", file.rewritten.content)?;
+                    writeln!(writer, "{}", file.content().unwrap_or_default())?;
                 } else {
-                    info!("{}", file.rewritten.content);
+                    info!("{}", file.content().unwrap_or_default());
                 }
             }
             MatchResult::RemoveFile(file) => {
@@ -417,6 +505,11 @@ impl Messager for TransformedMessenger<'_> {
     }
     fn track_supress(&mut self, _supressed: &MatchResult) -> anyhow::Result<()> {
         self.total_supressed += 1;
+        Ok(())
+    }
+
+    fn emit_log(&mut self, log: &marzano_messenger::SimpleLogMessage) -> anyhow::Result<()> {
+        log::debug!("Log received over RPC: {:?}", log);
         Ok(())
     }
 }

@@ -6,14 +6,14 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::info;
 use marzano_core::{
     api::{
-        is_match, AllDone, AllDoneReason, EnforcementLevel, MatchResult, RewriteReason,
-        RewriteSource,
+        is_match, AllDone, AllDoneReason, EnforcementLevel, MatchReason, MatchResult, RewriteSource,
     },
     fs::apply_rewrite,
     problem::Problem,
 };
 use marzano_gritmodule::{config::ResolvedGritDefinition, utils::extract_path};
 use marzano_language::target_language::{expand_paths, PatternLanguage};
+use marzano_messenger::emit::{FlushableMessenger as _, VisibilityLevels};
 use marzano_util::cache::GritCache;
 use marzano_util::rich_path::RichPath;
 use marzano_util::{finder::get_input_files, rich_path::RichFile};
@@ -25,7 +25,7 @@ use std::{
 };
 use tokio::try_join;
 
-use marzano_messenger::emit::{Messager, VisibilityLevels};
+use marzano_messenger::emit::Messager;
 
 #[cfg(feature = "server")]
 use cli_server::check::CheckMessenger;
@@ -251,6 +251,7 @@ pub(crate) async fn run_check(
             false,
             None,
             root_path.as_ref(),
+            VisibilityLevels::Supplemental,
         )
         .await?;
 
@@ -284,11 +285,13 @@ pub(crate) async fn run_check(
             for result in results {
                 let rewrite_with_reason = match &result.result {
                     MatchResult::Rewrite(r) => {
-                        let reason = Some(RewriteReason {
+                        let reason = Some(MatchReason {
                             metadata_json: None,
                             source: RewriteSource::Gritql,
+                            title: result.pattern.title().map(|s| s.to_string()),
                             name: Some(result.pattern.local_name.to_string()),
                             level: Some(result.pattern.level()),
+                            explanation: None,
                         });
                         let mut rewrite = r.clone();
                         rewrite.reason = reason;
@@ -298,9 +301,7 @@ pub(crate) async fn run_check(
                 };
                 let rewrite_with_reason = rewrite_with_reason.as_ref();
                 let message = rewrite_with_reason.unwrap_or(&result.result);
-                emitter
-                    .emit(message, &VisibilityLevels::Supplemental)
-                    .unwrap();
+                emitter.emit(message).unwrap();
             }
         }
         let safe_total_file_count = std::cmp::min(total_file_count, i32::MAX as usize) as i32;
@@ -309,9 +310,7 @@ pub(crate) async fn run_check(
             found: 0,
             reason: AllDoneReason::AllMatchesFound,
         });
-        emitter
-            .emit(&all_done, &VisibilityLevels::Supplemental)
-            .unwrap();
+        emitter.emit(&all_done).unwrap();
 
         emitter.flush().await?;
 

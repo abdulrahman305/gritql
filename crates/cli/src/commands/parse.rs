@@ -43,7 +43,9 @@ pub(crate) async fn run_parse(
         bail!("Only JSONL output is supported for parse command");
     }
 
-    let mut emitter = JSONLineMessenger::new(io::stdout(), OutputMode::default());
+    let visibility = VisibilityLevels::Hidden;
+
+    let mut emitter = JSONLineMessenger::new(io::stdout(), OutputMode::default(), visibility);
 
     let parse_input = ParseInput {
         pattern_body: pattern_body.to_owned().unwrap_or_default(),
@@ -54,11 +56,10 @@ pub(crate) async fn run_parse(
     let lang: TargetLanguage = PatternLanguage::get_language(&parse_input.pattern_body)
         .unwrap_or_default()
         .try_into()?;
-    let visibility = VisibilityLevels::Hidden;
 
     if let Some(body) = pattern_body {
         let result = parse_one_pattern(body, None).await?;
-        emitter.emit(&result, &visibility)?;
+        emitter.emit(&result)?;
     }
 
     for path in parse_input.paths {
@@ -75,7 +76,7 @@ pub(crate) async fn run_parse(
             };
             MatchResult::InputFile(input_file)
         };
-        emitter.emit(&match_result, &visibility)?;
+        emitter.emit(&match_result)?;
     }
 
     Ok(())
@@ -86,7 +87,8 @@ async fn parse_one_pattern(body: String, path: Option<&PathBuf>) -> Result<Match
     let resolver = GritModuleResolver::new();
     let lang = PatternLanguage::get_language(&body);
     let pattern = resolver.make_pattern(&body, None)?;
-    let pattern_libs = crate::resolver::get_grit_files_from_cwd().await?;
+    let fake_flags = GlobalFormatFlags::default();
+    let pattern_libs = crate::resolver::get_grit_files_from_flags_or_cwd(&fake_flags).await?;
     let pattern_libs = pattern_libs.get_language_directory_or_default(lang)?;
     let problem = match pattern.compile(&pattern_libs, None, None, None) {
         Ok(problem) => problem,

@@ -96,8 +96,7 @@ pub fn rewrite_as_edit(doc: &TextDocumentItem, result: Rewrite) -> TextEdit {
         let end = offset_to_zero_based_position(current_content.len(), current_content);
         tower_lsp::lsp_types::Range { start, end }
     };
-    let new_text = result.rewritten.content;
-    TextEdit::new(old_range, new_text)
+    TextEdit::new(old_range, result.rewritten.content.unwrap_or_default())
 }
 
 fn offset_to_zero_based_position(offset: usize, content: &str) -> Position {
@@ -127,7 +126,7 @@ pub fn check_intersection(range1: &Range, range2: &Range) -> bool {
 
 pub(crate) fn get_ai_built_in_functions_for_feature() -> Option<BuiltIns> {
     #[cfg(not(feature = "ai_builtins"))]
-    return None;
+    return marzano_core::built_in_functions::get_ai_placeholder_functions();
     #[cfg(feature = "ai_builtins")]
     return Some(ai_builtins::ai_builtins::get_ai_built_in_functions());
 }

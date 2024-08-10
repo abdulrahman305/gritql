@@ -1,7 +1,16 @@
+use std::{
+    env, fs,
+    io::{BufRead, BufReader},
+    process::Stdio,
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
+
 use anyhow::Result;
 use insta::assert_snapshot;
 
-use crate::common::{get_fixture, get_test_cmd};
+use crate::common::{get_fixture, get_test_cmd, get_test_process_cmd};
 
 mod common;
 
@@ -306,6 +315,130 @@ fn tests_python_pattern_with_file_name() -> Result<()> {
     let output = test.output()?;
 
     assert!(output.status.success());
+
+    Ok(())
+}
+
+#[test]
+fn test_watch_mode_changed() -> Result<()> {
+    let (tx, rx) = mpsc::channel();
+
+    let (temp_dir, temp_fixture_path) = get_fixture("patterns_test", false)?;
+    let test_yaml_path = temp_fixture_path.join(".grit/grit.yaml");
+
+    println!("temp_fixture_path: {:?}", test_yaml_path);
+    println!("temp_dir_path: {:?}", temp_dir.into_path());
+
+    let _cmd_handle = thread::spawn(move || {
+        let mut cmd = get_test_process_cmd()
+            .unwrap()
+            .args(["patterns", "test", "--watch"])
+            .current_dir(&temp_fixture_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to start command");
+
+        let stdout = BufReader::new(cmd.stdout.take().unwrap());
+        let stderr = BufReader::new(cmd.stderr.take().unwrap());
+        for line in stdout.lines().chain(stderr.lines()).flatten() {
+            println!("LINE: {:?}", line);
+            tx.send(line).unwrap();
+        }
+    });
+    thread::sleep(Duration::from_secs(3));
+
+    // Update it
+    let old_content = fs::read_to_string(&test_yaml_path).expect("Unable to read the file");
+    let new_content = old_content.replace("console.log(bar)", "console.log(bad)");
+    fs::write(&test_yaml_path, new_content)?;
+    thread::sleep(Duration::from_secs(3));
+
+    // Then reset it
+    fs::write(&test_yaml_path, old_content)?;
+    thread::sleep(Duration::from_secs(3));
+
+    let mut output = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        output.push(line);
+    }
+    let expected_output = vec![
+        "Found 2 testable patterns.",
+        "Watching for changes",
+        "✓ All 7 samples passed.",
+        ".grit/grit.yaml was modified",
+        "1 out of 1 samples failed.",
+    ];
+    for expected_line in expected_output {
+        assert!(
+            output.iter().any(|line| line.contains(expected_line)),
+            "Expected output not found: {}",
+            expected_line
+        );
+    }
+
+    assert!(
+        output
+            .iter()
+            .filter(|line| line.contains("samples passed"))
+            .count()
+            == 2
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_watch_mode_deleted() -> Result<()> {
+    let (tx, rx) = mpsc::channel();
+
+    let (temp_dir, temp_fixture_path) = get_fixture("patterns_test", false)?;
+    let test_yaml_path = temp_fixture_path.join(".grit/grit.yaml");
+
+    println!("temp_fixture_path: {:?}", test_yaml_path);
+    println!("temp_dir_path: {:?}", temp_dir.into_path());
+
+    let _cmd_handle = thread::spawn(move || {
+        let mut cmd = get_test_process_cmd()
+            .unwrap()
+            .args(["patterns", "test", "--watch"])
+            .current_dir(&temp_fixture_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to start command");
+
+        let stdout = BufReader::new(cmd.stdout.take().unwrap());
+        let stderr = BufReader::new(cmd.stderr.take().unwrap());
+        for line in stdout.lines().chain(stderr.lines()).flatten() {
+            println!("LINE: {:?}", line);
+            tx.send(line).unwrap();
+        }
+    });
+    thread::sleep(Duration::from_secs(3));
+
+    // Update it to an empty config
+    fs::write(&test_yaml_path, "patterns: []")?;
+    thread::sleep(Duration::from_secs(3));
+
+    let mut output = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        output.push(line);
+    }
+    let expected_output = vec![
+        "Found 2 testable patterns.",
+        "Watching for changes",
+        "✓ All 7 samples passed.",
+        ".grit/grit.yaml was modified",
+        "no testable pattern changes were found",
+    ];
+    for expected_line in expected_output {
+        assert!(
+            output.iter().any(|line| line.contains(expected_line)),
+            "Expected output not found: {}",
+            expected_line
+        );
+    }
 
     Ok(())
 }

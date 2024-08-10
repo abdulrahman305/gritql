@@ -68,6 +68,7 @@ pub(crate) async fn run_apply(
             return crate::workflows::run_remote_workflow(
                 args.pattern_or_workflow,
                 args.apply_migration_args,
+                ranges,
             )
             .await;
         }
@@ -80,6 +81,7 @@ pub(crate) async fn run_apply(
                 ranges,
                 args.apply_migration_args,
                 flags,
+                args.apply_pattern_args.visibility,
             )
             .await;
         }

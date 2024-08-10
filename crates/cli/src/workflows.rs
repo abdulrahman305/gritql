@@ -4,6 +4,7 @@ use console::style;
 use log::debug;
 use marzano_auth::env::{get_grit_api_url, ENV_VAR_GRIT_API_URL, ENV_VAR_GRIT_AUTH_TOKEN};
 use marzano_gritmodule::{fetcher::LocalRepo, searcher::find_grit_dir_from};
+use marzano_messenger::workflows::WorkflowMessenger;
 use marzano_messenger::{emit::Messager, workflows::PackagedWorkflowOutcome};
 use marzano_util::diff::FileDiff;
 use serde::Serialize;
@@ -53,7 +54,7 @@ pub async fn run_bin_workflow<M>(
     mut arg: WorkflowInputs,
 ) -> Result<(M, PackagedWorkflowOutcome)>
 where
-    M: Messager + Send + 'static,
+    M: Messager + WorkflowMessenger + Send + 'static,
 {
     let cwd = std::env::current_dir()?;
 
@@ -67,9 +68,10 @@ where
     #[cfg(feature = "workflow_server")]
     let (server_addr, handle, shutdown_tx) = {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let server_addr = format!("http://{}", socket.local_addr()?);
+        let socket = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let server_addr = format!("http://{}", socket.local_addr()?).to_string();
         let handle = grit_cloud_client::spawn_server_tasks(emitter, shutdown_rx, socket);
+        log::info!("Started local server at {}", server_addr);
         (server_addr, handle, shutdown_tx)
     };
 
@@ -101,7 +103,7 @@ where
         );
     }
 
-    let auth = updater.get_valid_auth().map_err(|_| {
+    let auth = updater.get_valid_auth().await.map_err(|_| {
         anyhow::anyhow!(
             "No valid authentication token found, please run {}",
             style("grit auth login").bold().red()
@@ -173,7 +175,8 @@ where
         Ok((
             emitter,
             PackagedWorkflowOutcome {
-                message: Some("Workflow completed successfully".to_string()),
+                message: None,
+                outcome: None,
                 success: true,
                 data: None,
             },
@@ -182,7 +185,8 @@ where
         Ok((
             emitter,
             PackagedWorkflowOutcome {
-                message: Some("Workflow failed".to_string()),
+                message: None,
+                outcome: None,
                 success: false,
                 data: None,
             },
@@ -190,32 +194,18 @@ where
     }
 }
 
-pub fn display_workflow_outcome(outcome: PackagedWorkflowOutcome) -> Result<()> {
-    match outcome.success {
-        true => {
-            log::info!(
-                "{}",
-                outcome
-                    .message
-                    .unwrap_or("Workflow completed successfully".to_string())
-            );
-            Ok(())
-        }
-        false => anyhow::bail!(outcome.message.unwrap_or("Workflow failed".to_string())),
-    }
-}
-
 #[cfg(feature = "remote_workflows")]
 pub async fn run_remote_workflow(
     workflow_name: String,
     args: crate::commands::apply_migration::ApplyMigrationArgs,
+    ranges: Option<Vec<FileDiff>>,
 ) -> Result<()> {
     use colored::Colorize;
     use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
     use marzano_gritmodule::fetcher::ModuleRepo;
     use std::time::Duration;
 
-    let updater = Updater::from_current_bin().await?;
+    let mut updater = Updater::from_current_bin().await?;
     let cwd = std::env::current_dir()?;
 
     let pb = ProgressBar::with_draw_target(Some(0), ProgressDrawTarget::stderr());
@@ -225,7 +215,7 @@ pub async fn run_remote_workflow(
     pb.set_message("Authenticating with Grit Cloud");
     pb.enable_steady_tick(Duration::from_millis(60));
 
-    let auth = updater.get_valid_auth()?;
+    let auth = updater.get_valid_auth().await?;
 
     pb.set_message("Launching workflow on Grit Cloud");
 
@@ -235,6 +225,15 @@ pub async fn run_remote_workflow(
     if let Some(username) = auth.get_user_name()? {
         if !input.contains_key(GRIT_VCS_USER_NAME) {
             input.insert(GRIT_VCS_USER_NAME.to_string(), username.into());
+        }
+    }
+
+    if let Some(ranges) = ranges {
+        if !input.contains_key(GRIT_TARGET_RANGES) {
+            input.insert(
+                GRIT_TARGET_RANGES.to_string(),
+                serde_json::to_value(ranges)?,
+            );
         }
     }
 

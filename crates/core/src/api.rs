@@ -2,7 +2,7 @@ use crate::{fs, problem::Problem, tree_sitter_serde::tree_sitter_node_to_json};
 use anyhow::{bail, Result};
 use grit_pattern_matcher::file_owners::FileOwner;
 pub use grit_util::ByteRange;
-use grit_util::{AnalysisLog as GritAnalysisLog, Ast, InputRanges, Position, Range, VariableMatch};
+use grit_util::{AnalysisLog as GritAnalysisLog, Ast, Position, Range, VariableMatch};
 use im::Vector;
 use marzano_language::grit_ts_node::grit_node_types;
 use marzano_language::language::{MarzanoLanguage, Tree};
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
 use std::path::PathBuf;
 use std::{fmt, str::FromStr, vec};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
@@ -43,20 +44,31 @@ impl MatchResult {
     pub fn is_error(&self) -> bool {
         matches!(self, MatchResult::AnalysisLog(log) if log.level < 400)
     }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MatchResult::PatternInfo(_) => "PatternInfo",
+            MatchResult::AllDone(_) => "AllDone",
+            MatchResult::Match(_) => "Match",
+            MatchResult::InputFile(_) => "InputFile",
+            MatchResult::Rewrite(_) => "Rewrite",
+            MatchResult::CreateFile(_) => "CreateFile",
+            MatchResult::RemoveFile(_) => "RemoveFile",
+            MatchResult::DoneFile(_) => "DoneFile",
+            MatchResult::AnalysisLog(_) => "AnalysisLog",
+        }
+    }
 }
 
 /// Make a path look the way provolone expects it to
 /// Removes leading "./", or the root path if it's provided
 fn normalize_path_in_project<'a>(path: &'a str, root_path: Option<&'a PathBuf>) -> &'a str {
-    #[cfg(debug_assertions)]
     if let Some(root_path) = root_path {
-        if !root_path.to_str().unwrap_or_default().ends_with('/') {
-            panic!("root_path must end with a slash.");
-        }
-    }
-    if let Some(root_path) = root_path {
-        let root_path = root_path.to_str().unwrap();
-        path.strip_prefix(root_path).unwrap_or(path)
+        let basic = path
+            .strip_prefix(root_path.to_string_lossy().as_ref())
+            .unwrap_or(path);
+        // Stip the leading / if it's there
+        basic.strip_prefix('/').unwrap_or(basic)
     } else {
         path.strip_prefix("./").unwrap_or(path)
     }
@@ -101,9 +113,8 @@ impl MatchResult {
         }
     }
 
-    pub(crate) fn file_to_match_result<'a>(
+    pub(crate) fn file_to_match_result(
         file: &Vector<&FileOwner<Tree>>,
-        language: &impl MarzanoLanguage<'a>,
     ) -> Result<Option<MatchResult>> {
         if file.is_empty() {
             bail!("cannot have file with no versions")
@@ -118,12 +129,8 @@ impl MatchResult {
                 if ranges.suppressed {
                     return Ok(None);
                 }
-                return Ok(Some(MatchResult::Match(Match::file_to_match(
-                    ranges,
-                    file.name.to_string_lossy().as_ref(),
-                    &file.tree,
-                    language,
-                ))));
+                let fm = EntireFile::from_file(file)?;
+                return Ok(Some(MatchResult::Match(fm.into())));
             } else {
                 return Ok(None);
             }
@@ -131,7 +138,6 @@ impl MatchResult {
             return Ok(Some(MatchResult::Rewrite(Rewrite::file_to_rewrite(
                 file.front().unwrap(),
                 file.back().unwrap(),
-                language,
             )?)));
         }
     }
@@ -150,7 +156,7 @@ impl MatchResult {
         }
     }
 
-    fn extract_original_match(&self) -> Option<&Match> {
+    fn extract_original_match(&self) -> Option<EntireFile> {
         match self {
             MatchResult::DoneFile(_)
             | MatchResult::AnalysisLog(_)
@@ -158,16 +164,58 @@ impl MatchResult {
             | MatchResult::CreateFile(_)
             | MatchResult::AllDone(_)
             | MatchResult::PatternInfo(_) => None,
-            MatchResult::Match(m)
-            | MatchResult::RemoveFile(RemoveFile { original: m, .. })
-            | MatchResult::Rewrite(Rewrite { original: m, .. }) => Some(m),
+            MatchResult::Match(m) => Some(m.clone().into()),
+            MatchResult::RemoveFile(RemoveFile { original: m, .. }) => Some(m.clone()),
+            MatchResult::Rewrite(Rewrite { original: m, .. }) => Some(m.clone()),
+        }
+    }
+
+    fn extract_reason(&self) -> Option<&MatchReason> {
+        match self {
+            MatchResult::Match(Match { reason: r, .. })
+            | MatchResult::RemoveFile(RemoveFile { reason: r, .. })
+            | MatchResult::Rewrite(Rewrite { reason: r, .. })
+            | MatchResult::CreateFile(CreateFile { reason: r, .. }) => r.as_ref(),
+            MatchResult::PatternInfo(_)
+            | MatchResult::AllDone(_)
+            | MatchResult::InputFile(_)
+            | MatchResult::DoneFile(_)
+            | MatchResult::AnalysisLog(_) => None,
         }
     }
 
     /// Extract the original path, if any
     pub fn extract_original_path(&self) -> Option<&str> {
-        let original_match = self.extract_original_match()?;
-        Some(&original_match.source_file)
+        match self {
+            MatchResult::DoneFile(_)
+            | MatchResult::AnalysisLog(_)
+            | MatchResult::InputFile(_)
+            | MatchResult::CreateFile(_)
+            | MatchResult::AllDone(_)
+            | MatchResult::PatternInfo(_) => None,
+            MatchResult::Match(m) => Some(&m.source_file),
+            MatchResult::RemoveFile(r) => Some(&r.original.source_file),
+            MatchResult::Rewrite(r) => Some(&r.original.source_file),
+        }
+    }
+
+    /// Get the original content
+    pub fn extract_original_content(&self) -> Option<&str> {
+        match self {
+            MatchResult::DoneFile(_)
+            | MatchResult::AnalysisLog(_)
+            | MatchResult::InputFile(_)
+            | MatchResult::CreateFile(_)
+            | MatchResult::AllDone(_)
+            | MatchResult::PatternInfo(_) => None,
+            MatchResult::Match(m) => m.content().ok(),
+            MatchResult::RemoveFile(r) => r.original.content.as_deref(),
+            MatchResult::Rewrite(r) => r.original.content.as_deref(),
+        }
+    }
+
+    pub fn get_ranges(&self) -> Option<&Vec<Range>> {
+        fs::extract_ranges(self)
     }
 
     /// Given a MatchResult, create a MatchResult::Rewrite that suppresses the match.
@@ -186,13 +234,13 @@ impl MatchResult {
         let original_file_name = self.extract_original_path()?;
         let original_match = self.extract_original_match()?;
 
-        let original_src = fs_err::read_to_string(original_file_name).ok()?;
-        let rewritten_content =
-            split_string_at_indices(&original_src, ranges_starts).join(&comment);
+        let original_src = self.extract_original_content()?;
+        let rewritten_content = split_string_at_indices(original_src, ranges_starts).join(&comment);
         let ef = EntireFile::file_to_entire_file(original_file_name, &rewritten_content, None);
         Some(MatchResult::Rewrite(Rewrite::new(
-            original_match.clone(),
+            original_match,
             ef,
+            self.extract_reason().cloned(),
         )))
     }
 }
@@ -240,6 +288,7 @@ pub fn is_match(result: &MatchResult) -> bool {
 
 pub trait FileMatchResult {
     fn file_name(&self) -> &str;
+    fn content(&self) -> Result<&str>;
     fn ranges(&mut self) -> &Vec<Range>;
     // A verb representing the action taken on the file
     fn action() -> &'static str;
@@ -253,6 +302,7 @@ pub struct PatternInfo {
     pub source_file: String,
     pub parsed_pattern: String,
     pub valid: bool,
+    pub uses_ai: bool,
 }
 
 impl PatternInfo {
@@ -265,12 +315,16 @@ impl PatternInfo {
             &grit_node_types,
         ))
         .unwrap();
+
+        let uses_ai = crate::analysis::uses_ai(&compiled.pattern, &compiled.definitions());
+
         Self {
             messages: vec![],
             variables: compiled.compiled_vars(),
             source_file,
             parsed_pattern,
             valid: true,
+            uses_ai,
         }
     }
 }
@@ -285,36 +339,48 @@ pub struct InputFile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct Match {
+    // Do *NOT* use serde(flatten) in wasm-serializable items
+    // Due to https://github.com/RReverser/serde-wasm-bindgen/issues/49, they will end up as maps.
     #[serde(default)]
     pub messages: Vec<Message>,
     #[serde(default)]
     pub variables: Vec<VariableMatch>,
     pub source_file: String,
+    /// The full content of the file
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub ranges: Vec<Range>,
     #[serde(default)]
-    pub debug: String,
+    pub reason: Option<MatchReason>,
+    #[serde(default)]
+    pub id: Uuid,
 }
 
-impl Match {
-    fn file_to_match<'a>(
-        match_ranges: &InputRanges,
-        name: &str,
-        tree: &Tree,
-        language: &impl MarzanoLanguage<'a>,
-    ) -> Self {
-        let input_file_debug_text = to_string_pretty(&tree_sitter_node_to_json(
-            &tree.root_node().node,
-            &tree.source,
-            language,
-        ))
-        .unwrap();
+impl From<EntireFile> for Match {
+    fn from(file_match: EntireFile) -> Self {
         Self {
-            debug: input_file_debug_text,
-            source_file: name.to_owned(),
-            ranges: match_ranges.ranges.clone(),
-            variables: match_ranges.variables.clone(),
-            messages: vec![],
+            messages: file_match.messages,
+            variables: file_match.variables,
+            source_file: file_match.source_file,
+            ranges: file_match.ranges,
+            reason: None,
+            content: file_match.content,
+            id: Uuid::new_v4(),
+        }
+    }
+}
+
+impl From<Match> for EntireFile {
+    fn from(file_match: Match) -> Self {
+        Self {
+            messages: file_match.messages,
+            variables: file_match.variables,
+            source_file: file_match.source_file,
+            ranges: file_match.ranges,
+            // TODO: fix this or drop byte_ranges entirely
+            byte_ranges: None,
+            content: file_match.content,
         }
     }
 }
@@ -329,6 +395,17 @@ impl FileMatchResult for Match {
     fn action() -> &'static str {
         "matched"
     }
+    fn content(&self) -> Result<&str> {
+        let Some(content) = self.content.as_deref() else {
+            bail!("No content in match")
+        };
+
+        if content.is_empty() {
+            bail!("No content in match")
+        } else {
+            Ok(content)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -339,50 +416,61 @@ pub struct EntireFile {
     #[serde(default)]
     pub variables: Vec<VariableMatch>,
     pub source_file: String,
-    pub content: String,
+    pub content: Option<String>,
     pub byte_ranges: Option<Vec<ByteRange>>,
+    #[serde(default)]
+    pub ranges: Vec<Range>,
 }
 
 impl EntireFile {
+    /// Create an entire file for cases where we don't really have an original file to reference
+    /// When working with rewrites, `from_file` should be used instead
     fn file_to_entire_file(name: &str, body: &str, byte_range: Option<&Vec<ByteRange>>) -> Self {
         Self {
             source_file: name.to_owned(),
-            content: body.to_owned(),
+            content: Some(body.to_owned()),
             variables: vec![],
             messages: vec![],
             byte_ranges: byte_range.map(|r| r.to_owned()),
+            ranges: vec![],
         }
     }
 
+    /// Create an entire file from a file owner, including handling source maps and byte ranges
     fn from_file(file: &FileOwner<Tree>) -> Result<Self> {
-        if let Some(source_map) = &file.tree.source_map {
+        let mut basic = if let Some(source_map) = &file.tree.source_map {
             let outer_source = source_map.fill_with_inner(&file.tree.source)?;
 
-            Ok(Self::file_to_entire_file(
+            Self::file_to_entire_file(
                 file.name.to_string_lossy().as_ref(),
                 &outer_source,
                 // Exclude the matches, since they aren't reliable yet
                 None,
-            ))
+            )
         } else {
-            Ok(Self::file_to_entire_file(
+            Self::file_to_entire_file(
                 file.name.to_string_lossy().as_ref(),
                 file.tree.outer_source(),
                 file.matches.borrow().byte_ranges.as_ref(),
-            ))
-        }
+            )
+        };
+        if let Some(input_ranges) = file.matches.borrow().input_matches.as_ref() {
+            basic.ranges = input_ranges.ranges.clone();
+            basic.variables = input_ranges.variables.clone();
+        };
+        Ok(basic)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct Rewrite {
-    pub original: Match,
+    pub original: EntireFile,
     pub rewritten: EntireFile,
-    /// Deprecated
     #[serde(default)]
-    pub ansi_summary: String,
-    pub reason: Option<RewriteReason>,
+    pub reason: Option<MatchReason>,
+    #[serde(default)]
+    pub id: Uuid,
 }
 
 impl From<Rewrite> for MatchResult {
@@ -392,23 +480,13 @@ impl From<Rewrite> for MatchResult {
 }
 
 impl Rewrite {
-    fn file_to_rewrite<'a>(
+    fn file_to_rewrite(
         initial: &FileOwner<Tree>,
         rewritten_file: &FileOwner<Tree>,
-        language: &impl MarzanoLanguage<'a>,
     ) -> Result<Self> {
-        let original = if let Some(ranges) = &initial.matches.borrow().input_matches {
-            Match::file_to_match(
-                ranges,
-                initial.name.to_string_lossy().as_ref(),
-                &initial.tree,
-                language,
-            )
-        } else {
-            bail!("cannot have rewrite without matches")
-        };
+        let original = EntireFile::from_file(initial)?;
         let rewritten = EntireFile::from_file(rewritten_file)?;
-        Ok(Rewrite::new(original, rewritten))
+        Ok(Rewrite::new(original, rewritten, None))
     }
 }
 
@@ -422,14 +500,27 @@ impl FileMatchResult for Rewrite {
     fn action() -> &'static str {
         "rewritten"
     }
+    fn content(&self) -> Result<&str> {
+        self.rewritten.content.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No content in rewritten file {}",
+                self.rewritten.source_file
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
-pub struct RewriteReason {
+pub struct MatchReason {
     pub metadata_json: Option<String>,
     pub source: RewriteSource,
+    /// The name of the pattern that matched, or another programmatic identifier
     pub name: Option<String>,
+    /// A human-readable title for the match
+    pub title: Option<String>,
+    /// A human-readable explanation of the match
+    pub explanation: Option<String>,
     pub level: Option<EnforcementLevel>,
 }
 
@@ -477,12 +568,12 @@ pub enum RewriteSource {
 }
 
 impl Rewrite {
-    pub fn new(original: Match, rewritten: EntireFile) -> Self {
+    pub fn new(original: EntireFile, rewritten: EntireFile, reason: Option<MatchReason>) -> Self {
         Self {
             original,
             rewritten,
-            ansi_summary: String::new(),
-            reason: None,
+            reason,
+            id: Uuid::new_v4(),
         }
     }
 }
@@ -491,8 +582,10 @@ impl Rewrite {
 #[serde(rename_all = "camelCase")]
 pub struct CreateFile {
     pub rewritten: EntireFile,
-    pub ansi_summary: String,
     range: Option<Vec<Range>>,
+    pub reason: Option<MatchReason>,
+    #[serde(default)]
+    pub id: Uuid,
 }
 
 impl From<CreateFile> for MatchResult {
@@ -505,8 +598,9 @@ impl CreateFile {
     fn file_to_create(name: &str, body: &str) -> CreateFile {
         CreateFile {
             rewritten: EntireFile::file_to_entire_file(name, body, None),
-            ansi_summary: String::new(),
             range: None,
+            reason: None,
+            id: Uuid::new_v4(),
         }
     }
 }
@@ -520,12 +614,12 @@ impl FileMatchResult for CreateFile {
             Some(ref r) => r,
             None => {
                 let start = Position::first();
-                let end = Position::last(&self.rewritten.content);
+                let end = Position::last(self.rewritten.content.as_deref().unwrap_or_default());
                 self.range = Some(vec![Range::new(
                     start,
                     end,
                     0,
-                    self.rewritten.content.len() as u32,
+                    self.rewritten.content.as_deref().unwrap_or_default().len() as u32,
                 )]);
                 self.ranges()
             }
@@ -534,13 +628,21 @@ impl FileMatchResult for CreateFile {
     fn action() -> &'static str {
         "created"
     }
+    fn content(&self) -> Result<&str> {
+        self.rewritten.content.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("No content in created file {}", self.rewritten.source_file)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoveFile {
-    pub original: Match,
-    pub ansi_summary: String,
+    pub original: EntireFile,
+    #[serde(default)]
+    pub reason: Option<MatchReason>,
+    #[serde(default)]
+    pub id: Uuid,
 }
 
 impl From<RemoveFile> for MatchResult {
@@ -558,6 +660,11 @@ impl FileMatchResult for RemoveFile {
     }
     fn action() -> &'static str {
         "removed"
+    }
+    fn content(&self) -> Result<&str> {
+        self.original.content.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("No content in removed file {}", self.original.source_file)
+        })
     }
 }
 
@@ -595,7 +702,9 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct AllDone {
+    /// How many files have been processed
     pub processed: i32,
+    /// How many matches were found
     pub found: i32,
     pub reason: AllDoneReason,
 }
@@ -668,7 +777,7 @@ impl From<GritAnalysisLog> for AnalysisLog {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Serialize, Debug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Debug, Copy, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum AnalysisLogLevel {
     Error = 200,
@@ -707,11 +816,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_normalize_path_in_project_with_root_no_slash() {
         let path = "/home/user/project/src/main.rs";
         let root_path = PathBuf::from("/home/user/project");
-        normalize_path_in_project(path, Some(&root_path));
+        assert_eq!(
+            normalize_path_in_project(path, Some(&root_path)),
+            "src/main.rs",
+        );
     }
 
     #[test]

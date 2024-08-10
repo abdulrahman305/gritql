@@ -6,6 +6,17 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::Path;
 
+use grit_pattern_matcher::{
+    constants::DEFAULT_FILE_NAME,
+    context::StaticDefinitions,
+    pattern::{DynamicPattern, Pattern, PatternOrPredicate},
+};
+
+use crate::{
+    pattern_compiler::compiler::{defs_to_filenames, DefsToFilenames},
+    problem::MarzanoQueryContext,
+};
+
 /// Walks the call tree and returns true if the predicate is true for any node.
 /// This is potentially error-prone, so not entirely recommended
 fn walk_call_tree(
@@ -93,8 +104,128 @@ pub fn defines_itself(root: &NodeWithSource, root_name: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// Using source code alone, find dependents of a pattern.
+/// This is *NOT* a good implementation and has numerous performance issues,
+/// but it is good enough for `grit patterns test --watch`
+///
+/// Consider refactoring if this is used in a more performance-critical context
+pub fn get_dependents_of_target_patterns_by_traversal_from_src(
+    libs: &BTreeMap<String, String>,
+    src: &str,
+    parser: &mut MarzanoGritParser,
+    target_patterns: &[&String],
+) -> Result<Vec<String>> {
+    let mut dependents = <Vec<String>>::new();
+    let node_like = "nodeLike";
+    let predicate_call = "predicateCall";
+
+    let tree = parser.parse_file(src, Some(Path::new(DEFAULT_FILE_NAME)))?;
+
+    let DefsToFilenames {
+        patterns: pattern_file,
+        predicates: predicate_file,
+        functions: function_file,
+        foreign_functions: foreign_file,
+    } = defs_to_filenames(libs, parser, tree.root_node())?;
+
+    let name_to_filename: BTreeMap<&String, &String> = pattern_file
+        .iter()
+        .chain(predicate_file.iter())
+        .chain(function_file.iter())
+        .chain(foreign_file.iter())
+        .collect();
+
+    let mut traversed_stack = <Vec<String>>::new();
+    let mut stack: Vec<marzano_language::language::Tree> = vec![tree];
+    while let Some(tree) = stack.pop() {
+        let root = tree.root_node();
+        let cursor = root.walk();
+
+        for n in traverse(cursor, Order::Pre).filter(|n| {
+            n.node.is_named() && (n.node.kind() == node_like || n.node.kind() == predicate_call)
+        }) {
+            let name = n
+                .child_by_field_name("name")
+                .ok_or_else(|| anyhow!("missing name of nodeLike"))?;
+            let name = name.text()?;
+            let name = name.trim().to_string();
+
+            if target_patterns.contains(&&name) {
+                while let Some(e) = traversed_stack.pop() {
+                    dependents.push(e);
+                }
+            }
+            if let Some(file_name) = name_to_filename.get(&name) {
+                if let Some(tree) = find_child_tree_definition(
+                    file_name,
+                    parser,
+                    libs,
+                    &mut traversed_stack,
+                    &name,
+                )? {
+                    stack.push(tree);
+                }
+            }
+        }
+    }
+    Ok(dependents)
+}
+
+/// Attempt to find where a pattern is defined
+fn find_child_tree_definition(
+    file_name: &str,
+    parser: &mut MarzanoGritParser,
+    libs: &BTreeMap<String, String>,
+    traversed_stack: &mut Vec<String>,
+    name: &str,
+) -> Result<Option<marzano_language::language::Tree>> {
+    if !traversed_stack.contains(&name.to_string()) {
+        if let Some(file_body) = libs.get(file_name) {
+            traversed_stack.push(name.to_owned());
+            let tree = parser.parse_file(file_body, Some(Path::new(file_name)))?;
+            return Ok(Some(tree));
+        }
+    }
+    Ok(None)
+}
+
+fn uses_named_function(
+    root: &Pattern<MarzanoQueryContext>,
+    definitions: &StaticDefinitions<MarzanoQueryContext>,
+    function_name: &str,
+) -> bool {
+    for pattern in root.iter(definitions) {
+        if let PatternOrPredicate::Pattern(grit_pattern_matcher::pattern::Pattern::CallBuiltIn(
+            call,
+        )) = pattern
+        {
+            if call.name == function_name {
+                return true;
+            }
+        }
+        if let PatternOrPredicate::DynamicPattern(DynamicPattern::CallBuiltIn(call)) = pattern {
+            if call.name == function_name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn uses_ai(
+    root: &Pattern<MarzanoQueryContext>,
+    definitions: &StaticDefinitions<MarzanoQueryContext>,
+) -> bool {
+    uses_named_function(root, definitions, "llm_chat")
+}
+
 #[cfg(test)]
 mod tests {
+    use grit_pattern_matcher::has_rewrite;
+    use marzano_language::target_language::TargetLanguage;
+
+    use crate::pattern_compiler::src_to_problem_libs;
+
     use super::*;
     use std::collections::BTreeMap;
 
@@ -160,5 +291,282 @@ mod tests {
             .unwrap();
         let decided = is_async(&parsed.root_node(), &libs, &mut parser).unwrap();
         assert!(decided);
+    }
+
+    #[test]
+    fn test_is_rewrite() {
+        let pattern_src = r#"
+            `console.log` => `console.error`
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(has_rewrite(&problem.pattern, &problem.definitions()));
+    }
+
+    #[test]
+    fn test_is_not_rewrite() {
+        let pattern_src = r#"
+            `console.log($msg)` where {
+                $msg <: not contains `foo`
+            }
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(!has_rewrite(&problem.pattern, &problem.definitions()));
+    }
+
+    #[test]
+    fn test_is_rewrite_with_pattern_call() {
+        let pattern_src = r#"
+            pattern pattern_with_rewrite() {
+                `console.log($msg)` => `console.error($msg)`
+            }
+            pattern_with_rewrite()
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(has_rewrite(&problem.pattern, &problem.definitions()));
+    }
+
+    #[test]
+    fn test_is_not_rewrite_with_pattern_call() {
+        let pattern_src = r#"
+            pattern pattern_with_rewrite() {
+                `console.log($msg)` => `console.error($msg)`
+            }
+            pattern pattern_without_rewrite() {
+                `console.log($msg)`
+            }
+            pattern_without_rewrite()
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(!has_rewrite(&problem.pattern, &problem.definitions()));
+    }
+
+    #[test]
+    fn test_is_rewrite_with_yaml() {
+        let pattern_src = r#"
+            language yaml
+
+            or {
+            `- $item` where {
+                $item => `nice: car
+            second: detail`
+            }
+            }
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(has_rewrite(&problem.pattern, &problem.definitions()));
+    }
+
+    #[test]
+    fn test_is_rewrite_with_insert() {
+        let pattern_src = r#"
+            language yaml
+
+            or {
+            `- $item` where {
+                $item += `good stuff`
+            }
+            }
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(has_rewrite(&problem.pattern, &problem.definitions()));
+    }
+
+    #[test]
+    fn test_is_rewrite_with_predicate() {
+        let pattern_src = r#"
+            pattern pattern_with_rewrite() {
+                `me` => `console.error(me)`
+            }
+
+            predicate predicate_with_rewrite() {
+                $program <: contains pattern_with_rewrite()
+            }
+
+            `you` where {
+                predicate_with_rewrite()
+            }
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(has_rewrite(&problem.pattern, &problem.definitions()));
+    }
+
+    #[test]
+    fn test_is_rewrite_with_function_call() {
+        let pattern_src = r#"
+            pattern pattern_with_rewrite() {
+                    `me` => `console.error(me)`
+                }
+
+            function more_indirection_is_good() {
+                if ($program <: contains pattern_with_rewrite()) {
+                    return `console.error($program)`
+                },
+                return `console.error($program)`
+            }
+
+            predicate predicate_with_function_call() {
+                $foo = more_indirection_is_good()
+            }
+
+            `you` where {
+                predicate_with_function_call()
+            }
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(has_rewrite(&problem.pattern, &problem.definitions()));
+        assert!(!uses_named_function(
+            &problem.pattern,
+            &problem.definitions(),
+            "text",
+        ));
+    }
+
+    #[test]
+    fn test_uses_text_fn() {
+        let pattern_src = r#"
+             `me` => text(`$program`)
+        "#
+        .to_string();
+        let libs = BTreeMap::new();
+        let problem = src_to_problem_libs(
+            pattern_src.to_string(),
+            &libs,
+            TargetLanguage::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .problem;
+
+        println!("problem: {:?}", problem);
+
+        assert!(has_rewrite(&problem.pattern, &problem.definitions()));
+        assert!(uses_named_function(
+            &problem.pattern,
+            &problem.definitions(),
+            "text",
+        ));
     }
 }

@@ -23,7 +23,7 @@
     "eslint-config-google": "^0.14.0",
     "node-gyp": "^10.0.1",
     "shelljs": "^0.8.5",
-    "tree-sitter-cli": "^0.21.0"
+    "tree-sitter-cli": "^0.22.6"
   },
   "scripts": {
     "build": "npm run build-php && npm run build-php_only && node-gyp rebuild",

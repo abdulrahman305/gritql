@@ -44,7 +44,7 @@
   },
   "devDependencies": {
     "regexp-util": "^1.2.2",
-    "standard-version": "7.0.0",
+    "standard-version": "9.5.0",
     "prebuildify": "^6.0.0"
   },
   "files": [
